@@ -55,3 +55,5 @@ class TriggerCog(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(TriggerCog(bot))
+
+# updating to prove existance
