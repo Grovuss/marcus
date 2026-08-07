@@ -7,6 +7,7 @@ Uses aiosqlite so nothing blocks the bot's event loop.
 """
 import aiosqlite
 import datetime
+import os
 from config import CONFIG
 
 SCHEMA = """
@@ -77,7 +78,7 @@ def _now() -> str:
 
 class Database:
     def __init__(self, path: str = None):
-        self.path = path or CONFIG["database"]["path"]
+        self.path = path or os.getenv("DB_PATH") or CONFIG["database"]["path"]
         self._db: aiosqlite.Connection = None
 
     async def connect(self):

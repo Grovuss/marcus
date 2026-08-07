@@ -32,6 +32,7 @@ EXTENSIONS = [
     "commands.channel",
     "commands.corpus",
     "commands.marcus",
+    "commands.trigger",
 ]
 
 DEV_GUILD_ID = os.getenv("DEV_GUILD_ID")
