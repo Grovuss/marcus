@@ -7,7 +7,8 @@ app = 'marcus-ebmldg'
 primary_region = 'ord'
 
 [build]
-
+  dockerfile = "Dockerfile"
+  
 [processes]
   app = "python bot.py"
 
