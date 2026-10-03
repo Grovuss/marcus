@@ -3,6 +3,10 @@ Core response decision-making: probability roll, cooldown enforcement,
 text-vs-GIF-vs-both selection, corpus fetching, generation, and
 duplicate-response prevention.
 
+In servers, Marcus only ever draws on what was logged in the channel he
+is replying in - never another channel or another server. In DMs he
+draws on everything he has logged, from every server.
+
 Cooldown state is kept in memory (per channel) since it's short-lived
 and doesn't need to survive a restart.
 """
@@ -11,8 +15,11 @@ import time
 
 import discord
 
+from config import CONFIG
 from database import Database
 from generator.generator import ResponseGenerator
+
+DM_SCOPE = 0  # recent_responses key used for duplicate prevention in DMs
 
 
 class Responder:
@@ -31,11 +38,14 @@ class Responder:
             return float(channel_settings["gif_response_chance"])
         return float(guild_settings["gif_response_chance"])
 
-    def _on_cooldown(self, channel_id: int, cooldown_seconds: int) -> bool:
+    def seconds_remaining_on_cooldown(self, channel_id: int, cooldown_seconds: int) -> float:
         last = self._last_response_at.get(channel_id)
         if last is None:
-            return False
-        return (time.monotonic() - last) < cooldown_seconds
+            return 0.0
+        return max(0.0, cooldown_seconds - (time.monotonic() - last))
+
+    def _on_cooldown(self, channel_id: int, cooldown_seconds: int) -> bool:
+        return self.seconds_remaining_on_cooldown(channel_id, cooldown_seconds) > 0
 
     def _mark_responded(self, channel_id: int):
         self._last_response_at[channel_id] = time.monotonic()
@@ -54,72 +64,98 @@ class Responder:
         roll = random.uniform(0, 100)
         return roll < chance
 
+    async def take_queued(self, channel_id: int) -> dict | None:
+        """An admin-queued message for this channel, if one is waiting (consumes it)."""
+        content = await self.db.pop_queued(channel_id)
+        if not content:
+            return None
+        self._mark_responded(channel_id)
+        return {"text": content, "gif_url": None}
+
     async def build_response(self, message: discord.Message):
+        return await self.generate_response(message.guild.id, message.channel.id)
+
+    async def generate_response(self, guild_id: int, channel_id: int):
         """
         Returns a dict: {"text": str|None, "gif_url": str|None}
-        or None if nothing generatable was found.
+        or None if nothing generatable was found in this channel's corpus.
         """
-        guild_settings = await self.db.get_guild_settings(message.guild.id)
-        channel_settings = await self.db.get_channel_settings(message.channel.id)
+        guild_settings = await self.db.get_guild_settings(guild_id)
+        channel_settings = await self.db.get_channel_settings(channel_id)
 
         gif_enabled = bool(guild_settings["gif_enabled"])
         gif_chance = self._effective_gif_chance(guild_settings, channel_settings) if gif_enabled else 0
 
+        result = await self._compose(
+            corpus_loader=lambda: self.db.get_corpus(channel_id=channel_id),
+            gif_loader=lambda: self.db.get_gifs(channel_id=channel_id),
+            gif_chance=gif_chance,
+            gen_settings=guild_settings,
+            dedupe_scope=guild_id,
+        )
+        if result:
+            self._mark_responded(channel_id)
+        return result
+
+    async def generate_dm_response(self):
+        """A response for a DM, drawn from everything Marcus has logged in every server."""
+        g = CONFIG["gif"]
+        r = CONFIG["response"]
+        gen_settings = {
+            "generation_mode": CONFIG["generation"]["mode"],
+            "min_words": r["min_words"],
+            "max_words": r["max_words"],
+        }
+        return await self._compose(
+            corpus_loader=lambda: self.db.get_corpus(shuffle=True),
+            gif_loader=lambda: self.db.get_gifs(),
+            gif_chance=g["response_chance"] if g["enabled"] else 0,
+            gen_settings=gen_settings,
+            dedupe_scope=DM_SCOPE,
+        )
+
+    async def _compose(self, corpus_loader, gif_loader, gif_chance: float, gen_settings: dict, dedupe_scope: int):
         roll = random.uniform(0, 100)
-        want_gif_only = gif_enabled and roll < gif_chance
+        want_gif_only = gif_chance > 0 and roll < gif_chance
         # small extra chance of text + gif together, only when not already gif-only
         want_gif_with_text = False
-        if gif_enabled and not want_gif_only:
+        if gif_chance > 0 and not want_gif_only:
             want_gif_with_text = random.uniform(0, 100) < (gif_chance / 4)
 
         gif_url = None
         if want_gif_only or want_gif_with_text:
-            gif_url = await self._pick_gif(message.guild.id, message.channel.id, guild_settings)
+            pool = await gif_loader()
+            gif_url = random.choice(pool) if pool else None
             if want_gif_only and gif_url:
-                self._mark_responded(message.channel.id)
                 return {"text": None, "gif_url": gif_url}
-            if want_gif_only and not gif_url:
-                # fall through to text generation instead of responding with nothing
-                want_gif_only = False
+            # no GIFs available: fall through to text instead of responding with nothing
 
-        text = await self._generate_text(message.guild.id, message.channel.id, guild_settings)
+        text = await self._generate_text(await corpus_loader(), gen_settings, dedupe_scope)
         if not text and not gif_url:
             return None
-
-        self._mark_responded(message.channel.id)
         return {"text": text, "gif_url": gif_url if want_gif_with_text else None}
 
     async def _pick_gif(self, guild_id: int, channel_id: int, guild_settings: dict) -> str | None:
-        prefer_local = bool(guild_settings["gif_channel_local_preference"])
-        if prefer_local:
-            local = await self.db.get_gifs(channel_id=channel_id)
-            if local:
-                return random.choice(local)
-        pool = await self.db.get_gifs(guild_id=guild_id)
-        if pool:
-            return random.choice(pool)
-        return None
+        pool = await self.db.get_gifs(channel_id=channel_id)
+        return random.choice(pool) if pool else None
 
-    async def _generate_text(self, guild_id: int, channel_id: int, guild_settings: dict, attempts: int = 5) -> str | None:
-        corpus = await self.db.get_corpus(channel_id=channel_id)
-        if len(corpus) < 5:
-            # not enough channel-local material yet, widen to the whole server
-            corpus = await self.db.get_corpus(guild_id=guild_id)
+    async def _generate_text(self, corpus: list[str], gen_settings: dict, dedupe_scope: int,
+                             attempts: int = 5) -> str | None:
         if not corpus:
             return None
 
         for _ in range(attempts):
             text = self.generator.generate(
                 corpus,
-                mode=guild_settings["generation_mode"],
-                min_words=guild_settings["min_words"],
-                max_words=guild_settings["max_words"],
+                mode=gen_settings["generation_mode"],
+                min_words=gen_settings["min_words"],
+                max_words=gen_settings["max_words"],
             )
             if not text:
                 return None
-            if not await self.db.was_recently_sent(guild_id, text):
-                await self.db.record_response(guild_id, text)
+            if not await self.db.was_recently_sent(dedupe_scope, text):
+                await self.db.record_response(dedupe_scope, text)
                 return text
         # exhausted attempts trying to avoid a repeat; send it anyway
-        await self.db.record_response(guild_id, text)
+        await self.db.record_response(dedupe_scope, text)
         return text

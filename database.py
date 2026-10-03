@@ -8,6 +8,7 @@ Uses aiosqlite so nothing blocks the bot's event loop.
 import aiosqlite
 import datetime
 import os
+import re
 from config import CONFIG
 
 SCHEMA = """
@@ -67,6 +68,26 @@ CREATE TABLE IF NOT EXISTS recent_responses (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_recent_responses_guild ON recent_responses(guild_id);
+
+CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id);
+CREATE INDEX IF NOT EXISTS idx_gifs_message_id ON gifs(message_id);
+
+-- Words/phrases/links Marcus must never remember (applies to every server).
+CREATE TABLE IF NOT EXISTS memory_filter (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    created_at TEXT NOT NULL
+);
+
+-- Messages an admin queued to be Marcus's next post in a channel.
+CREATE TABLE IF NOT EXISTS queued_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL,
+    guild_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_queued_messages_channel ON queued_messages(channel_id);
 """
 
 MAX_RECENT_RESPONSES_PER_GUILD = 25
@@ -76,16 +97,31 @@ def _now() -> str:
     return datetime.datetime.utcnow().isoformat()
 
 
+def _like(text: str) -> str:
+    """Escape a user search string for use in LIKE ... ESCAPE '\\'."""
+    return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _compile_filter(patterns: list[str]) -> re.Pattern | None:
+    """One case-insensitive regex matching any filter entry as a whole word/phrase."""
+    if not patterns:
+        return None
+    alternatives = "|".join(re.escape(p) for p in sorted(patterns, key=len, reverse=True))
+    return re.compile(rf"(?<!\w)(?:{alternatives})(?!\w)", re.IGNORECASE)
+
+
 class Database:
     def __init__(self, path: str = None):
         self.path = path or os.getenv("DB_PATH") or CONFIG["database"]["path"]
         self._db: aiosqlite.Connection = None
+        self._filter_re: re.Pattern | None = None
 
     async def connect(self):
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(SCHEMA)
         await self._db.commit()
+        await self._reload_filter()
 
     async def close(self):
         if self._db:
@@ -211,17 +247,29 @@ class Database:
     # ------------------------------------------------------------------
     # Message logging
     # ------------------------------------------------------------------
-    async def log_message(self, message_id, channel_id, guild_id, author_id, content):
+    async def log_message(self, message_id, channel_id, guild_id, author_id, content) -> bool:
+        """Returns False (and stores nothing) if the text hits the memory filter."""
+        if self.is_filtered(content):
+            return False
         await self._db.execute(
             """INSERT INTO messages (message_id, channel_id, guild_id, author_id, content, timestamp)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (str(message_id), str(channel_id), str(guild_id), str(author_id), content, _now()),
         )
         await self._db.commit()
+        return True
 
-    async def get_corpus(self, channel_id: int = None, guild_id: int = None, limit: int = 5000) -> list[str]:
-        """Returns a list of logged message text, most recent first."""
-        if channel_id is not None:
+    async def get_corpus(self, channel_id: int = None, guild_id: int = None, limit: int = 5000,
+                         shuffle: bool = False) -> list[str]:
+        """
+        Returns a list of logged message text, most recent first (or a
+        random sample when shuffle=True). Filtered entries are skipped.
+        """
+        if channel_id is None and guild_id is None and shuffle:
+            cur = await self._db.execute(
+                "SELECT content FROM messages ORDER BY RANDOM() LIMIT ?", (limit,)
+            )
+        elif channel_id is not None:
             cur = await self._db.execute(
                 "SELECT content FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?",
                 (str(channel_id), limit),
@@ -236,17 +284,72 @@ class Database:
                 "SELECT content FROM messages ORDER BY id DESC LIMIT ?", (limit,)
             )
         rows = await cur.fetchall()
-        return [r["content"] for r in rows]
+        return [r["content"] for r in rows if not self.is_filtered(r["content"])]
 
-    async def get_channel_messages(self, channel_id: int, limit: int = 100, offset: int = 0) -> list[dict]:
-        """Full logged message rows for one channel, most recent first (dashboard view)."""
+    async def get_timeline(self, channel_id: int = None, query: str = None,
+                           limit: int = 100, offset: int = 0) -> list[dict]:
+        """
+        Saved Discord messages for the dashboard, newest first, with each
+        message's text and GIFs grouped together. Optionally limited to
+        one channel and/or to messages whose text or GIF URL contains
+        `query`. Each entry: {message_id, channel_id, guild_id, author_id,
+        timestamp, texts: [{id, content}], gifs: [{id, url}]}.
+        """
+        where, params = [], []
+        if channel_id is not None:
+            where.append("channel_id = ?")
+            params.append(str(channel_id))
+        msg_where = list(where)
+        gif_where = list(where)
+        msg_params = list(params)
+        gif_params = list(params)
+        if query:
+            msg_where.append("content LIKE ? ESCAPE '\\'")
+            msg_params.append(_like(query))
+            gif_where.append("url LIKE ? ESCAPE '\\'")
+            gif_params.append(_like(query))
+
+        def clause(parts):
+            return ("WHERE " + " AND ".join(parts)) if parts else ""
+
         cur = await self._db.execute(
-            """SELECT id, message_id, author_id, content, timestamp FROM messages
-               WHERE channel_id = ? ORDER BY id DESC LIMIT ? OFFSET ?""",
-            (str(channel_id), limit, offset),
+            f"""SELECT message_id, channel_id, guild_id, author_id, MIN(timestamp) AS timestamp FROM (
+                    SELECT message_id, channel_id, guild_id, author_id, timestamp FROM messages {clause(msg_where)}
+                    UNION ALL
+                    SELECT message_id, channel_id, guild_id, author_id, timestamp FROM gifs {clause(gif_where)}
+                ) GROUP BY message_id, channel_id ORDER BY timestamp DESC LIMIT ? OFFSET ?""",
+            msg_params + gif_params + [limit, offset],
         )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+        entries = [dict(r, texts=[], gifs=[]) for r in await cur.fetchall()]
+        if not entries:
+            return entries
+
+        by_key = {(e["message_id"], e["channel_id"]): e for e in entries}
+        ids = list({e["message_id"] for e in entries})
+        marks = ",".join("?" * len(ids))
+        cur = await self._db.execute(
+            f"SELECT id, message_id, channel_id, content FROM messages WHERE message_id IN ({marks}) ORDER BY id", ids
+        )
+        for r in await cur.fetchall():
+            if (r["message_id"], r["channel_id"]) in by_key:
+                by_key[(r["message_id"], r["channel_id"])]["texts"].append({"id": r["id"], "content": r["content"]})
+        cur = await self._db.execute(
+            f"SELECT id, message_id, channel_id, url FROM gifs WHERE message_id IN ({marks}) ORDER BY id", ids
+        )
+        for r in await cur.fetchall():
+            if (r["message_id"], r["channel_id"]) in by_key:
+                by_key[(r["message_id"], r["channel_id"])]["gifs"].append({"id": r["id"], "url": r["url"]})
+        return entries
+
+    async def delete_message_row(self, row_id: int) -> int:
+        cur = await self._db.execute("DELETE FROM messages WHERE id = ?", (row_id,))
+        await self._db.commit()
+        return cur.rowcount
+
+    async def delete_gif_row(self, row_id: int) -> int:
+        cur = await self._db.execute("DELETE FROM gifs WHERE id = ?", (row_id,))
+        await self._db.commit()
+        return cur.rowcount
 
     async def count_by_channel(self, guild_id: int) -> dict[str, dict]:
         """{channel_id: {"messages": n, "gifs": n}} for every channel with logged data."""
@@ -286,7 +389,9 @@ class Database:
     # GIF logging
     # ------------------------------------------------------------------
     async def log_gif(self, message_id, channel_id, guild_id, author_id, url) -> bool:
-        """Returns True if inserted, False if it was a duplicate for that channel."""
+        """Returns True if inserted, False if it was a duplicate for that channel or filtered."""
+        if self.is_filtered(url):
+            return False
         try:
             await self._db.execute(
                 """INSERT INTO gifs (message_id, channel_id, guild_id, author_id, url, timestamp)
@@ -312,7 +417,7 @@ class Database:
         else:
             cur = await self._db.execute("SELECT url FROM gifs ORDER BY id DESC LIMIT ?", (limit,))
         rows = await cur.fetchall()
-        return [r["url"] for r in rows]
+        return [r["url"] for r in rows if not self.is_filtered(r["url"])]
 
     async def delete_channel_gifs(self, channel_id: int) -> int:
         cur = await self._db.execute("DELETE FROM gifs WHERE channel_id = ?", (str(channel_id),))
@@ -405,4 +510,86 @@ class Database:
                )""",
             (str(guild_id), str(guild_id), MAX_RECENT_RESPONSES_PER_GUILD),
         )
+        await self._db.commit()
+
+    # ------------------------------------------------------------------
+    # Memory filter (words/phrases/links that are never remembered)
+    # ------------------------------------------------------------------
+    async def _reload_filter(self):
+        cur = await self._db.execute("SELECT pattern FROM memory_filter")
+        self._filter_re = _compile_filter([r["pattern"] for r in await cur.fetchall()])
+
+    def is_filtered(self, text: str) -> bool:
+        return bool(self._filter_re and text and self._filter_re.search(text))
+
+    async def list_filter(self) -> list[dict]:
+        cur = await self._db.execute("SELECT id, pattern, created_at FROM memory_filter ORDER BY pattern")
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def add_filter(self, pattern: str) -> bool:
+        """Returns False if the pattern was already in the filter."""
+        try:
+            await self._db.execute(
+                "INSERT INTO memory_filter (pattern, created_at) VALUES (?, ?)", (pattern, _now())
+            )
+            await self._db.commit()
+        except aiosqlite.IntegrityError:
+            return False
+        await self._reload_filter()
+        return True
+
+    async def remove_filter(self, filter_id: int):
+        await self._db.execute("DELETE FROM memory_filter WHERE id = ?", (filter_id,))
+        await self._db.commit()
+        await self._reload_filter()
+
+    async def purge_filtered(self) -> int:
+        """Deletes every already-saved message/GIF that matches the current filter."""
+        if not self._filter_re:
+            return 0
+        removed = 0
+        for table, column in (("messages", "content"), ("gifs", "url")):
+            cur = await self._db.execute(f"SELECT id, {column} AS v FROM {table}")
+            ids = [r["id"] for r in await cur.fetchall() if self.is_filtered(r["v"])]
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                await self._db.execute(
+                    f"DELETE FROM {table} WHERE id IN ({','.join('?' * len(chunk))})", chunk
+                )
+            removed += len(ids)
+        await self._db.commit()
+        return removed
+
+    # ------------------------------------------------------------------
+    # Queued messages (admin-chosen next post for a channel)
+    # ------------------------------------------------------------------
+    async def queue_message(self, channel_id: int, guild_id: int, content: str):
+        await self._db.execute(
+            "INSERT INTO queued_messages (channel_id, guild_id, content, created_at) VALUES (?, ?, ?, ?)",
+            (str(channel_id), str(guild_id), content, _now()),
+        )
+        await self._db.commit()
+
+    async def list_queue(self, channel_id: int) -> list[dict]:
+        cur = await self._db.execute(
+            "SELECT id, content, created_at FROM queued_messages WHERE channel_id = ? ORDER BY id",
+            (str(channel_id),),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def pop_queued(self, channel_id: int) -> str | None:
+        """Removes and returns the oldest queued message for a channel, if any."""
+        cur = await self._db.execute(
+            "SELECT id, content FROM queued_messages WHERE channel_id = ? ORDER BY id LIMIT 1",
+            (str(channel_id),),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        await self._db.execute("DELETE FROM queued_messages WHERE id = ?", (row["id"],))
+        await self._db.commit()
+        return row["content"]
+
+    async def remove_queued(self, queue_id: int):
+        await self._db.execute("DELETE FROM queued_messages WHERE id = ?", (queue_id,))
         await self._db.commit()

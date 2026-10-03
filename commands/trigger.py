@@ -39,7 +39,9 @@ class TriggerCog(commands.Cog):
             )
             return
 
-        result = await self.bot.responder.generate_response(interaction.guild_id, target.id)
+        result = await self.bot.responder.take_queued(target.id)
+        if not result:
+            result = await self.bot.responder.generate_response(interaction.guild_id, target.id)
         if not result:
             await interaction.response.send_message(
                 f"Couldn't generate anything from {target.mention}'s corpus - it's probably too small yet.",

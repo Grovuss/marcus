@@ -38,13 +38,18 @@ class MessageCog(commands.Cog):
             )
             return
 
-        await self.bot.db.log_message(
+        saved = await self.bot.db.log_message(
             message_id=f"manual-{interaction.id}",
             channel_id=interaction.channel_id,
             guild_id=interaction.guild_id,
             author_id=interaction.user.id,
             content=cleaned,
         )
+        if not saved:
+            await interaction.response.send_message(
+                "That text matches Marcus's memory filter, so it wasn't saved.", ephemeral=True
+            )
+            return
         await interaction.response.send_message(
             f"Logged into the corpus for this channel:\n> {cleaned}", ephemeral=True
         )
@@ -57,12 +62,10 @@ class MessageCog(commands.Cog):
         guild_settings = await self.bot.db.get_guild_settings(interaction.guild_id)
 
         corpus = await self.bot.db.get_corpus(channel_id=target_channel.id)
-        if len(corpus) < 5:
-            corpus = await self.bot.db.get_corpus(guild_id=interaction.guild_id)
 
         if not corpus:
             await interaction.response.send_message(
-                "There's no corpus to generate from yet. Log some messages first "
+                f"There's no corpus for {target_channel.mention} yet. Log some messages there first "
                 "(enable a channel with `/channel add` or use `/message send`).",
                 ephemeral=True,
             )

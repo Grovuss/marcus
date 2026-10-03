@@ -90,7 +90,11 @@ class MarcusBot(commands.Bot):
         if message.author.bot:
             return
         if not message.guild:
-            return  # DMs are out of scope
+            # DMs are never logged; Marcus just answers with something
+            # drawn from his memory of every server.
+            result = await self.responder.generate_dm_response()
+            await self._send_response(message.channel, result or {"text": "..."})
+            return
 
         channel_settings = await self.db.get_channel_settings(message.channel.id)
 
@@ -116,7 +120,12 @@ class MarcusBot(commands.Bot):
                 )
 
         # --- Responding ---
-        if await self.responder.should_respond(message):
+        # A message queued from the dashboard goes out on the next human
+        # message in that channel, skipping the chance roll and cooldown.
+        queued = await self.responder.take_queued(message.channel.id)
+        if queued:
+            await self._send_response(message.channel, queued)
+        elif await self.responder.should_respond(message):
             result = await self.responder.build_response(message)
             if result:
                 await self._send_response(message.channel, result)

@@ -159,10 +159,11 @@ cooldown, and generation settings at a glance.
 2. Author IDs are kept **only** so admins can delete a specific user's
    data later (`/corpus clear user:`). They are never passed into the
    generation system — generation only ever sees the text itself.
-3. When Marcus decides to respond, it pulls the relevant corpus
-   (preferring the current channel, falling back to the whole server if
-   there isn't enough local data yet) and runs one of two generation
-   methods:
+3. When Marcus decides to respond in a server, it pulls **only** the
+   corpus (and GIFs) logged in that same channel. It never borrows from
+   another channel or another server. When someone DMs Marcus, he
+   replies using everything he's logged in every server (DMs themselves
+   are never logged). Either way it runs one of two generation methods:
    - **Markov chains**: builds a word-level n-gram model (order
      configurable, default 2) from the corpus and walks it randomly.
    - **Fragment recombination**: splits stored messages into "head" and
@@ -255,8 +256,24 @@ fly secrets set DASHBOARD_PASSWORD=something-long-and-random
 ```
 
 The browser asks for a login. Leave the username blank or type anything,
-and enter the password. Messages sent from the dashboard can't ping
-@everyone, @here or roles.
+and enter the password.
+
+What you can do there:
+
+- **Send now** posts a message as Marcus right away. Dashboard messages
+  can't ping @everyone, @here or roles.
+- **Queue as next message** makes it Marcus's next post in that channel.
+  It goes out the next time someone talks there (or uses `/trigger`),
+  skipping the response chance and cooldown.
+- **Search** saved messages in one channel, or in every server from the
+  Search page. GIFs show up inside the message they came from.
+- **Forget** removes a single saved message or GIF.
+- **Add to memory** saves your own phrase or GIF link into a channel's
+  memory, as if someone had said it there.
+- **Memory filter** is a list of words, phrases or links that Marcus
+  never remembers, in any server. Matching is whole-word and ignores
+  capitalization. Adding an entry can also forget everything already
+  saved that matches.
 
 ---
 
