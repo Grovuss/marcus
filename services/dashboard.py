@@ -231,6 +231,7 @@ class Dashboard:
         app.router.add_post("/item/delete", self.delete_item)
         app.router.add_post("/filter/add", self.add_filter)
         app.router.add_post("/filter/{filter_id}/delete", self.delete_filter)
+        app.router.add_post("/filter/{filter_id}/response", self.set_filter_response)
         self.app = app
 
     async def start(self):
@@ -584,14 +585,23 @@ class Dashboard:
     async def filter_view(self, request: web.Request):
         entries = await self.bot.db.list_filter()
         rows = "".join(
-            f"<tr><td>{esc(f['pattern'])}</td><td class='muted'>{esc((f['created_at'] or '')[:10])}</td>"
+            f"<tr><td>{esc(f['pattern'])}</td><td>"
+            + self._form(
+                f"/filter/{f['id']}/response",
+                f"<input type='text' name='response' value='{esc(f['response'] or '')}' "
+                f"maxlength='{MAX_MESSAGE_LEN}' placeholder='No autoresponse'>"
+                "<button class='x'>save</button>",
+                cls="row",
+            )
+            + f"</td><td class='muted'>{esc((f['created_at'] or '')[:10])}</td>"
             f"<td class='num'>" + self._form(f"/filter/{f['id']}/delete", "<button class='x'>remove</button>")
             + "</td></tr>"
             for f in entries
         )
         table = (
-            "<div class='card'><table><tr><th>Word / phrase / link</th><th>Added</th><th></th></tr>"
-            + (rows or "<tr><td colspan='3' class='muted'>The filter is empty.</td></tr>")
+            "<div class='card'><table><tr><th>Word / phrase / link</th><th>Autoresponse</th>"
+            "<th>Added</th><th></th></tr>"
+            + (rows or "<tr><td colspan='4' class='muted'>The filter is empty.</td></tr>")
             + "</table></div>"
         )
         form = self._form(
@@ -599,6 +609,8 @@ class Dashboard:
             "<div class='row'><input type='text' name='pattern' required "
             f"maxlength='{MAX_FILTER_LEN}' placeholder='Word, phrase, or GIF link'>"
             "<button>Add to filter</button></div>"
+            f"<input type='text' name='response' maxlength='{MAX_MESSAGE_LEN}' "
+            "placeholder='Optional autoresponse: what Marcus says when someone says this ({user} pings them)'>"
             "<label class='check'><input type='checkbox' name='purge' value='1' checked>"
             "Also forget everything already saved that matches</label>",
             cls="stack card pad",
@@ -607,6 +619,9 @@ class Dashboard:
             "<h1>Memory filter</h1><div class='crumbs'>Applies to every server. A saved message or GIF "
             "containing any of these (whole words, any capitalization) is never remembered, and is "
             "never used in a response.</div>"
+            "<div class='crumbs'>If an entry has an <b>autoresponse</b>, Marcus replies with it every time "
+            "someone says that entry in a channel where he responds, or in a DM. It replaces his usual "
+            "random reply to that message. Put <code>{user}</code> in the response to ping whoever said it.</div>"
             f"{form}<h2>Filtered ({len(entries)})</h2>{table}"
         )
         return page("Memory filter", body, request)
@@ -693,12 +708,28 @@ class Dashboard:
             raise redirect("/filter", error="Enter a word, phrase, or link.")
         if len(pattern) > MAX_FILTER_LEN:
             raise redirect("/filter", error=f"Keep filter entries under {MAX_FILTER_LEN} characters.")
-        added = await self.bot.db.add_filter(pattern)
-        msg = f"Added “{pattern}” to the filter." if added else f"“{pattern}” was already in the filter."
+        response = str(form.get("response", "")).strip() or None
+        if response and len(response) > MAX_MESSAGE_LEN:
+            raise redirect("/filter", error=f"Autoresponses max out at {MAX_MESSAGE_LEN} characters.")
+        added = await self.bot.db.add_filter(pattern, response)
+        if added:
+            msg = f"Added “{pattern}” to the filter."
+        elif response:
+            msg = f"“{pattern}” was already in the filter; its autoresponse was updated."
+        else:
+            msg = f"“{pattern}” was already in the filter."
         if form.get("purge"):
             removed = await self.bot.db.purge_filtered()
             msg += f" Forgot {removed} saved item{'s' if removed != 1 else ''} that matched."
         raise redirect("/filter", ok=msg)
+
+    async def set_filter_response(self, request: web.Request):
+        form = await request.post()
+        response = str(form.get("response", "")).strip()
+        if len(response) > MAX_MESSAGE_LEN:
+            raise redirect("/filter", error=f"Autoresponses max out at {MAX_MESSAGE_LEN} characters.")
+        await self.bot.db.set_filter_response(self._int_param(request, "filter_id"), response or None)
+        raise redirect("/filter", ok="Autoresponse saved." if response else "Autoresponse removed.")
 
     async def delete_filter(self, request: web.Request):
         await self.bot.db.remove_filter(self._int_param(request, "filter_id"))

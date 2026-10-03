@@ -278,7 +278,10 @@ What you can do there:
 - **Memory filter** is a list of words, phrases or links that Marcus
   never remembers, in any server. Matching is whole-word and ignores
   capitalization. Adding an entry can also forget everything already
-  saved that matches.
+  saved that matches. An entry can also have an **autoresponse**: a
+  preset message Marcus sends every time someone says it, in channels
+  where he responds and in DMs. `{user}` in the response pings whoever
+  said it.
 
 ---
 

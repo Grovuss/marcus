@@ -92,6 +92,8 @@ class MarcusBot(commands.Bot):
         if not message.guild:
             # DMs are never logged; Marcus just answers with something
             # drawn from his memory of every server.
+            if await self._send_autoresponse(message):
+                return
             result = await self.responder.generate_dm_response()
             await self._send_response(message.channel, result or {"text": "..."})
             return
@@ -120,6 +122,11 @@ class MarcusBot(commands.Bot):
                 )
 
         # --- Responding ---
+        # Memory-filter autoresponses always fire in channels Marcus talks
+        # in, and replace any other response to that message.
+        if channel_settings and channel_settings["responses_enabled"] and await self._send_autoresponse(message):
+            return
+
         # A message queued from the dashboard goes out on the next human
         # message in that channel, skipping the chance roll and cooldown.
         queued = await self.responder.take_queued(message.channel.id)
@@ -129,6 +136,17 @@ class MarcusBot(commands.Bot):
             result = await self.responder.build_response(message)
             if result:
                 await self._send_response(message.channel, result)
+
+    async def _send_autoresponse(self, message: discord.Message) -> bool:
+        """Reply with a memory filter entry's preset response, if the message says one."""
+        response = self.db.autoresponse_for(message.content)
+        if not response:
+            return False
+        await message.channel.send(
+            response.replace("{user}", message.author.mention),
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+        )
+        return True
 
     async def _send_response(self, channel: discord.abc.Messageable, result: dict):
         parts = []

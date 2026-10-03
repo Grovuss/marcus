@@ -77,6 +77,7 @@ CREATE INDEX IF NOT EXISTS idx_gifs_message_id ON gifs(message_id);
 CREATE TABLE IF NOT EXISTS memory_filter (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     pattern TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    response TEXT,  -- optional autoresponse sent when the pattern is said
     created_at TEXT NOT NULL
 );
 
@@ -119,6 +120,7 @@ class Database:
         self.path = path or os.getenv("DB_PATH") or CONFIG["database"]["path"]
         self._db: aiosqlite.Connection = None
         self._filter_re: re.Pattern | None = None
+        self._autoresponses: dict[str, str] = {}  # lowercased pattern -> response
 
     async def connect(self):
         self._db = await aiosqlite.connect(self.path)
@@ -136,6 +138,9 @@ class Database:
             await self._db.execute(
                 "ALTER TABLE channel_settings ADD COLUMN dm_hidden INTEGER NOT NULL DEFAULT 0"
             )
+        cur = await self._db.execute("PRAGMA table_info(memory_filter)")
+        if "response" not in {r["name"] for r in await cur.fetchall()}:
+            await self._db.execute("ALTER TABLE memory_filter ADD COLUMN response TEXT")
 
     async def close(self):
         if self._db:
@@ -560,30 +565,61 @@ class Database:
         await self._db.commit()
 
     # ------------------------------------------------------------------
-    # Memory filter (words/phrases/links that are never remembered)
+    # Memory filter (words/phrases/links that are never remembered),
+    # each optionally with an autoresponse Marcus sends when it's said.
     # ------------------------------------------------------------------
     async def _reload_filter(self):
-        cur = await self._db.execute("SELECT pattern FROM memory_filter")
-        self._filter_re = _compile_filter([r["pattern"] for r in await cur.fetchall()])
+        cur = await self._db.execute("SELECT pattern, response FROM memory_filter")
+        rows = await cur.fetchall()
+        self._filter_re = _compile_filter([r["pattern"] for r in rows])
+        self._autoresponses = {r["pattern"].lower(): r["response"] for r in rows if r["response"]}
 
     def is_filtered(self, text: str) -> bool:
         return bool(self._filter_re and text and self._filter_re.search(text))
 
+    def autoresponse_for(self, text: str) -> str | None:
+        """The preset response for the first filter entry in `text` that has one."""
+        if not (self._filter_re and self._autoresponses and text):
+            return None
+        for match in self._filter_re.finditer(text):
+            response = self._autoresponses.get(" ".join(match.group(0).split()).lower())
+            if response:
+                return response
+        return None
+
     async def list_filter(self) -> list[dict]:
-        cur = await self._db.execute("SELECT id, pattern, created_at FROM memory_filter ORDER BY pattern")
+        cur = await self._db.execute(
+            "SELECT id, pattern, response, created_at FROM memory_filter ORDER BY pattern"
+        )
         return [dict(r) for r in await cur.fetchall()]
 
-    async def add_filter(self, pattern: str) -> bool:
-        """Returns False if the pattern was already in the filter."""
+    async def add_filter(self, pattern: str, response: str | None = None) -> bool:
+        """
+        Returns False if the pattern was already in the filter (its
+        autoresponse is still updated when one is given).
+        """
         try:
             await self._db.execute(
-                "INSERT INTO memory_filter (pattern, created_at) VALUES (?, ?)", (pattern, _now())
+                "INSERT INTO memory_filter (pattern, response, created_at) VALUES (?, ?, ?)",
+                (pattern, response, _now()),
             )
-            await self._db.commit()
+            added = True
         except aiosqlite.IntegrityError:
-            return False
+            added = False
+            if response:
+                await self._db.execute(
+                    "UPDATE memory_filter SET response = ? WHERE pattern = ?", (response, pattern)
+                )
+        await self._db.commit()
         await self._reload_filter()
-        return True
+        return added
+
+    async def set_filter_response(self, filter_id: int, response: str | None):
+        await self._db.execute(
+            "UPDATE memory_filter SET response = ? WHERE id = ?", (response or None, filter_id)
+        )
+        await self._db.commit()
+        await self._reload_filter()
 
     async def remove_filter(self, filter_id: int):
         await self._db.execute("DELETE FROM memory_filter WHERE id = ?", (filter_id,))
