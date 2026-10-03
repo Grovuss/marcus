@@ -98,7 +98,7 @@ class Responder:
         return result
 
     async def generate_dm_response(self):
-        """A response for a DM, drawn from everything Marcus has logged in every server."""
+        """A response for a DM, drawn from every server (except channels hidden via /channel dms)."""
         g = CONFIG["gif"]
         r = CONFIG["response"]
         gen_settings = {
@@ -107,8 +107,8 @@ class Responder:
             "max_words": r["max_words"],
         }
         return await self._compose(
-            corpus_loader=lambda: self.db.get_corpus(shuffle=True),
-            gif_loader=lambda: self.db.get_gifs(),
+            corpus_loader=lambda: self.db.get_dm_corpus(),
+            gif_loader=lambda: self.db.get_dm_gifs(),
             gif_chance=g["response_chance"] if g["enabled"] else 0,
             gen_settings=gen_settings,
             dedupe_scope=DM_SCOPE,

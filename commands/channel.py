@@ -7,6 +7,8 @@ logged data is kept - use /corpus clear to actually delete it).
 `enable`/`disable` toggle just the response behavior, leaving logging
 as-is, for channels where you want Marcus to keep learning quietly
 without talking.
+`dms` controls whether a channel's memory can be used in Marcus's DM
+replies (it never affects what he says in the channel itself).
 """
 import discord
 from discord import app_commands
@@ -67,6 +69,21 @@ class ChannelCog(commands.Cog):
         await self.bot.db.set_channel_responses_enabled(channel.id, False)
         await interaction.response.send_message(f"Responses disabled in {channel.mention}.")
 
+    @channel_group.command(name="dms", description="Allow or block this channel's messages from showing up in Marcus's DMs.")
+    @app_commands.describe(
+        channel="The channel to change",
+        allowed="True: Marcus may use this channel's messages in DMs. False: never.",
+    )
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def dms(self, interaction: discord.Interaction, channel: discord.TextChannel, allowed: bool):
+        await self.bot.db.set_channel_dm_hidden(channel.id, interaction.guild_id, hidden=not allowed)
+        if allowed:
+            msg = f"Messages from {channel.mention} can show up in Marcus's DMs again."
+        else:
+            msg = (f"Messages and GIFs from {channel.mention} will **never** show up in Marcus's DMs. "
+                   f"Marcus still uses them in {channel.mention} itself.")
+        await interaction.response.send_message(msg)
+
     @channel_group.command(name="list", description="List all configured channels and their status.")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def list_channels(self, interaction: discord.Interaction):
@@ -87,7 +104,9 @@ class ChannelCog(commands.Cog):
             responses_state = "ON" if row["responses_enabled"] else "OFF"
             chance = row["response_chance"]
             chance_str = f"{chance:g}%" if chance is not None else f"{guild_settings['global_response_chance']:g}% (default)"
-            lines.append(f"{name} - Logging: **{logging_state}**, Responses: **{responses_state}**, Chance: **{chance_str}**")
+            dms_state = "OFF" if row.get("dm_hidden") else "ON"
+            lines.append(f"{name} - Logging: **{logging_state}**, Responses: **{responses_state}**, "
+                         f"Chance: **{chance_str}**, In DMs: **{dms_state}**")
 
         embed = discord.Embed(title="Marcus - Configured Channels", description="\n".join(lines), color=discord.Color.blurple())
         await interaction.response.send_message(embed=embed)

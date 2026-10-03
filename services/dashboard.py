@@ -97,6 +97,55 @@ form.inline { display:inline; margin:0; }
 .gif a { font-size:12px; word-break:break-all; }
 .queue li { margin:6px 0; }
 label.check { display:flex; gap:6px; align-items:center; font-size:14px; }
+.live { font-size:12px; color:var(--ok); margin-bottom:6px; }
+.live.off { color:var(--muted); }
+@keyframes fresh { from { background:var(--mark); } to { background:transparent; } }
+.entry.fresh { animation:fresh 2.5s ease-out; }
+"""
+
+# Polls /live every few seconds and drops newly logged messages into the
+# top of the timeline (replacing an entry in place if it already shows).
+LIVE_JS = """
+<script>
+(() => {
+  const list = document.getElementById('timeline');
+  const status = document.getElementById('live-status');
+  if (!list || !list.dataset.live) return;
+  let m = list.dataset.m, g = list.dataset.g, busy = false;
+  async function poll() {
+    if (busy || document.hidden) return;
+    busy = true;
+    try {
+      const url = new URL(list.dataset.live, location.origin);
+      url.searchParams.set('m', m);
+      url.searchParams.set('g', g);
+      url.searchParams.set('back', location.pathname + location.search);
+      const res = await fetch(url, {credentials: 'same-origin', cache: 'no-store'});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      m = data.m; g = data.g;
+      for (const html of data.entries.slice().reverse()) {
+        const tpl = document.createElement('template');
+        tpl.innerHTML = html.trim();
+        const node = tpl.content.firstElementChild;
+        const old = document.getElementById(node.id);
+        if (old) old.replaceWith(node); else list.prepend(node);
+        node.classList.add('fresh');
+      }
+      if (data.entries.length) list.querySelector('.empty')?.remove();
+      status.textContent = '● Live: new messages appear here as Marcus saves them';
+      status.classList.remove('off');
+    } catch (err) {
+      status.textContent = '○ Live updates paused, retrying…';
+      status.classList.add('off');
+    } finally {
+      busy = false;
+    }
+  }
+  setInterval(poll, 3000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+})();
+</script>
 """
 
 
@@ -175,6 +224,7 @@ class Dashboard:
         app.router.add_get("/g/{guild_id}", self.guild_view)
         app.router.add_get("/c/{channel_id}", self.channel_view)
         app.router.add_get("/filter", self.filter_view)
+        app.router.add_get("/live", self.live)
         app.router.add_post("/c/{channel_id}/send", self.send_message)
         app.router.add_post("/c/{channel_id}/memory", self.add_memory)
         app.router.add_post("/queue/{queue_id}/delete", self.delete_queued)
@@ -276,9 +326,54 @@ class Dashboard:
             + "</form>"
         )
 
+    async def _entry_html(self, e: dict, query: str, back: str, show_channel: bool) -> str:
+        """One saved Discord message (its text and GIFs) as a timeline block."""
+        channel = self.bot.get_channel(int(e["channel_id"]))
+        guild = getattr(channel, "guild", None) or self.bot.get_guild(int(e["guild_id"]))
+        author = await self._author_name(guild, e["author_id"])
+        ts = (e["timestamp"] or "")[:16].replace("T", " ")
+        mid = str(e["message_id"])
+        source = ""
+        if mid.startswith("dash-"):
+            source = " <span class='tag'>added from dashboard</span>"
+        elif mid.startswith("manual-"):
+            source = " <span class='tag'>/message send</span>"
+        where = ""
+        if show_channel:
+            cname = f"#{channel.name}" if channel else f"channel {e['channel_id']}"
+            gname = guild.name if guild else f"server {e['guild_id']}"
+            where = f" · <a href='/c/{e['channel_id']}'>{esc(cname)}</a> in {esc(gname)}"
+
+        items = []
+        for t in e["texts"]:
+            items.append(
+                "<div class='item'>"
+                f"<div class='body'>{highlight(t['content'], query)}</div>"
+                + self._form("/item/delete", f"<input type='hidden' name='kind' value='message'>"
+                             f"<input type='hidden' name='id' value='{t['id']}'>"
+                             "<button class='x' title='Forget this message'>forget</button>", back=back)
+                + "</div>"
+            )
+        for g in e["gifs"]:
+            items.append(
+                f"<div class='item'><div class='gif'>{gif_html(g['url'])}</div>"
+                + self._form("/item/delete", f"<input type='hidden' name='kind' value='gif'>"
+                             f"<input type='hidden' name='id' value='{g['id']}'>"
+                             "<button class='x' title='Forget this GIF'>forget</button>", back=back)
+                + "</div>"
+            )
+        dom_id = esc(f"e-{e['channel_id']}-{mid}")
+        return (
+            f"<div class='entry' id='{dom_id}'><div class='meta'><b>{esc(author)}</b> · {esc(ts)} UTC{where}{source}</div>"
+            + "".join(items) + "</div>"
+        )
+
     async def _timeline_html(self, request: web.Request, channel_id: int | None, query: str,
                              show_channel: bool) -> str:
         page_no = self._page_no(request)
+        # Read the live-update cursor first so nothing logged mid-render is missed
+        # (anything picked up twice just replaces itself in the page).
+        max_message_row, max_gif_row = await self.bot.db.max_row_ids()
         entries = await self.bot.db.get_timeline(
             channel_id=channel_id, query=query or None, limit=PAGE_SIZE + 1, offset=(page_no - 1) * PAGE_SIZE
         )
@@ -286,49 +381,18 @@ class Dashboard:
         entries = entries[:PAGE_SIZE]
         back = request.path_qs
 
-        blocks = []
-        for e in entries:
-            channel = self.bot.get_channel(int(e["channel_id"]))
-            guild = getattr(channel, "guild", None) or self.bot.get_guild(int(e["guild_id"]))
-            author = await self._author_name(guild, e["author_id"])
-            ts = (e["timestamp"] or "")[:16].replace("T", " ")
-            mid = str(e["message_id"])
-            source = ""
-            if mid.startswith("dash-"):
-                source = " <span class='tag'>added from dashboard</span>"
-            elif mid.startswith("manual-"):
-                source = " <span class='tag'>/message send</span>"
-            where = ""
-            if show_channel:
-                cname = f"#{channel.name}" if channel else f"channel {e['channel_id']}"
-                gname = guild.name if guild else f"server {e['guild_id']}"
-                where = f" · <a href='/c/{e['channel_id']}'>{esc(cname)}</a> in {esc(gname)}"
-
-            items = []
-            for t in e["texts"]:
-                items.append(
-                    "<div class='item'>"
-                    f"<div class='body'>{highlight(t['content'], query)}</div>"
-                    + self._form("/item/delete", f"<input type='hidden' name='kind' value='message'>"
-                                 f"<input type='hidden' name='id' value='{t['id']}'>"
-                                 "<button class='x' title='Forget this message'>forget</button>", back=back)
-                    + "</div>"
-                )
-            for g in e["gifs"]:
-                items.append(
-                    f"<div class='item'><div class='gif'>{gif_html(g['url'])}</div>"
-                    + self._form("/item/delete", f"<input type='hidden' name='kind' value='gif'>"
-                                 f"<input type='hidden' name='id' value='{g['id']}'>"
-                                 "<button class='x' title='Forget this GIF'>forget</button>", back=back)
-                    + "</div>"
-                )
-            blocks.append(
-                f"<div class='entry'><div class='meta'><b>{esc(author)}</b> · {esc(ts)} UTC{where}{source}</div>"
-                + "".join(items) + "</div>"
-            )
-
+        blocks = [await self._entry_html(e, query, back, show_channel) for e in entries]
         empty = "No saved messages match that search." if query else "Nothing saved here yet."
-        listing = f"<div class='card'>{''.join(blocks) or f'<div class=pad><span class=muted>{empty}</span></div>'}</div>"
+        if not blocks:
+            blocks = [f"<div class='pad empty'><span class='muted'>{empty}</span></div>"]
+
+        # Only the first page follows new messages as they're logged.
+        live_attrs, status = "", ""
+        if page_no == 1:
+            live_url = "/live?" + urlencode({"channel": channel_id or "", "q": query})
+            live_attrs = f" data-live='{esc(live_url)}' data-m='{max_message_row}' data-g='{max_gif_row}'"
+            status = "<div class='live' id='live-status'>● Live: new messages appear here as Marcus saves them</div>"
+        listing = f"{status}<div class='card' id='timeline'{live_attrs}>{''.join(blocks)}</div>"
 
         def page_link(n):
             params = {"page": n}
@@ -340,7 +404,30 @@ class Dashboard:
         pager += f"<a href='{esc(page_link(page_no - 1))}'>← Newer</a>" if page_no > 1 else "<span></span>"
         pager += f"<a href='{esc(page_link(page_no + 1))}'>Older →</a>" if has_more else "<span></span>"
         pager += "</div>"
-        return listing + pager
+        return listing + pager + (LIVE_JS if page_no == 1 else "")
+
+    async def live(self, request: web.Request):
+        """New timeline entries since the page's cursor, as rendered HTML (polled by LIVE_JS)."""
+        try:
+            after_m = int(request.query["m"])
+            after_g = int(request.query["g"])
+            channel_id = int(request.query["channel"]) if request.query.get("channel") else None
+        except (KeyError, ValueError):
+            raise web.HTTPBadRequest(text="Bad live-update cursor.")
+        query = request.query.get("q", "").strip()
+        back = request.query.get("back", "/")
+
+        max_m, max_g = await self.bot.db.max_row_ids()
+        entries = await self.bot.db.get_timeline(
+            channel_id=channel_id, query=query or None, limit=PAGE_SIZE,
+            after_message_row=after_m, after_gif_row=after_g,
+        )
+        rendered = [await self._entry_html(e, query, back, show_channel=channel_id is None) for e in entries]
+        return web.json_response({
+            "m": max(after_m, max_m),
+            "g": max(after_g, max_g),
+            "entries": rendered,
+        })
 
     # ------------------------------------------------------------------
     # Pages
@@ -418,6 +505,8 @@ class Dashboard:
             tags += "<span class='tag on'>responding</span>"
         if not tags:
             tags = "<span class='tag'>off</span>"
+        if setting and setting.get("dm_hidden"):
+            tags += "<span class='tag'>hidden from DMs</span>"
         count = count or {"messages": 0, "gifs": 0}
         cat = f"<div class='muted'>{esc(category.name)}</div>" if category else ""
         return (

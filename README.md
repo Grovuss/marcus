@@ -123,10 +123,15 @@ channel-specific override, it falls back to the server-wide default.
 /channel remove #general
 /channel enable #general
 /channel disable #general
+/channel dms #general False
 /channel list
 ```
 Logging and responding are separate flags, so you can have Marcus
 quietly learn in a channel without ever posting there, or vice versa.
+
+`/channel dms #channel False` keeps that channel's messages and GIFs out
+of Marcus's DM replies (`True` allows them again). Marcus still uses
+them when talking in that channel.
 
 ### `/corpus` — corpus stats & management
 ```

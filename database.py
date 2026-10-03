@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS channel_settings (
     logging_enabled INTEGER NOT NULL DEFAULT 0,
     responses_enabled INTEGER NOT NULL DEFAULT 0,
     response_chance REAL,
-    gif_response_chance REAL
+    gif_response_chance REAL,
+    dm_hidden INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_channel_settings_guild ON channel_settings(guild_id);
 
@@ -92,6 +93,9 @@ CREATE INDEX IF NOT EXISTS idx_queued_messages_channel ON queued_messages(channe
 
 MAX_RECENT_RESPONSES_PER_GUILD = 25
 
+# WHERE clause (for messages/gifs) excluding channels marked hidden from DMs.
+DM_VISIBLE = "channel_id NOT IN (SELECT channel_id FROM channel_settings WHERE dm_hidden = 1)"
+
 
 def _now() -> str:
     return datetime.datetime.utcnow().isoformat()
@@ -120,8 +124,18 @@ class Database:
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(SCHEMA)
+        await self._migrate()
         await self._db.commit()
         await self._reload_filter()
+
+    async def _migrate(self):
+        """Add columns introduced after a database was first created."""
+        cur = await self._db.execute("PRAGMA table_info(channel_settings)")
+        columns = {r["name"] for r in await cur.fetchall()}
+        if "dm_hidden" not in columns:
+            await self._db.execute(
+                "ALTER TABLE channel_settings ADD COLUMN dm_hidden INTEGER NOT NULL DEFAULT 0"
+            )
 
     async def close(self):
         if self._db:
@@ -237,6 +251,15 @@ class Database:
         )
         await self._db.commit()
 
+    async def set_channel_dm_hidden(self, channel_id: int, guild_id: int, hidden: bool):
+        """Keep (or stop keeping) a channel's memory out of DM responses."""
+        await self._db.execute(
+            """INSERT INTO channel_settings (channel_id, guild_id, dm_hidden) VALUES (?, ?, ?)
+               ON CONFLICT(channel_id) DO UPDATE SET dm_hidden = excluded.dm_hidden""",
+            (str(channel_id), str(guild_id), 1 if hidden else 0),
+        )
+        await self._db.commit()
+
     async def set_channel_response_chance(self, channel_id: int, value: float | None):
         await self._db.execute(
             "UPDATE channel_settings SET response_chance = ? WHERE channel_id = ?",
@@ -259,17 +282,25 @@ class Database:
         await self._db.commit()
         return True
 
-    async def get_corpus(self, channel_id: int = None, guild_id: int = None, limit: int = 5000,
-                         shuffle: bool = False) -> list[str]:
-        """
-        Returns a list of logged message text, most recent first (or a
-        random sample when shuffle=True). Filtered entries are skipped.
-        """
-        if channel_id is None and guild_id is None and shuffle:
-            cur = await self._db.execute(
-                "SELECT content FROM messages ORDER BY RANDOM() LIMIT ?", (limit,)
-            )
-        elif channel_id is not None:
+    async def get_dm_corpus(self, limit: int = 5000) -> list[str]:
+        """A random sample of message text from every server, minus channels hidden from DMs."""
+        cur = await self._db.execute(
+            f"SELECT content FROM messages WHERE {DM_VISIBLE} ORDER BY RANDOM() LIMIT ?", (limit,)
+        )
+        rows = await cur.fetchall()
+        return [r["content"] for r in rows if not self.is_filtered(r["content"])]
+
+    async def get_dm_gifs(self, limit: int = 2000) -> list[str]:
+        """A random sample of GIFs from every server, minus channels hidden from DMs."""
+        cur = await self._db.execute(
+            f"SELECT url FROM gifs WHERE {DM_VISIBLE} ORDER BY RANDOM() LIMIT ?", (limit,)
+        )
+        rows = await cur.fetchall()
+        return [r["url"] for r in rows if not self.is_filtered(r["url"])]
+
+    async def get_corpus(self, channel_id: int = None, guild_id: int = None, limit: int = 5000) -> list[str]:
+        """Returns a list of logged message text, most recent first. Filtered entries are skipped."""
+        if channel_id is not None:
             cur = await self._db.execute(
                 "SELECT content FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?",
                 (str(channel_id), limit),
@@ -287,13 +318,15 @@ class Database:
         return [r["content"] for r in rows if not self.is_filtered(r["content"])]
 
     async def get_timeline(self, channel_id: int = None, query: str = None,
-                           limit: int = 100, offset: int = 0) -> list[dict]:
+                           limit: int = 100, offset: int = 0,
+                           after_message_row: int = None, after_gif_row: int = None) -> list[dict]:
         """
         Saved Discord messages for the dashboard, newest first, with each
         message's text and GIFs grouped together. Optionally limited to
         one channel and/or to messages whose text or GIF URL contains
-        `query`. Each entry: {message_id, channel_id, guild_id, author_id,
-        timestamp, texts: [{id, content}], gifs: [{id, url}]}.
+        `query`, and/or to messages with rows newer than the given row
+        ids (for live updates). Each entry: {message_id, channel_id,
+        guild_id, author_id, timestamp, texts: [{id, content}], gifs: [{id, url}]}.
         """
         where, params = [], []
         if channel_id is not None:
@@ -303,6 +336,12 @@ class Database:
         gif_where = list(where)
         msg_params = list(params)
         gif_params = list(params)
+        if after_message_row is not None:
+            msg_where.append("id > ?")
+            msg_params.append(after_message_row)
+        if after_gif_row is not None:
+            gif_where.append("id > ?")
+            gif_params.append(after_gif_row)
         if query:
             msg_where.append("content LIKE ? ESCAPE '\\'")
             msg_params.append(_like(query))
@@ -340,6 +379,14 @@ class Database:
             if (r["message_id"], r["channel_id"]) in by_key:
                 by_key[(r["message_id"], r["channel_id"])]["gifs"].append({"id": r["id"], "url": r["url"]})
         return entries
+
+    async def max_row_ids(self) -> tuple[int, int]:
+        """Newest (messages.id, gifs.id) - the live-update cursor for the dashboard."""
+        cur = await self._db.execute(
+            "SELECT (SELECT IFNULL(MAX(id), 0) FROM messages) AS m, (SELECT IFNULL(MAX(id), 0) FROM gifs) AS g"
+        )
+        row = await cur.fetchone()
+        return row["m"], row["g"]
 
     async def delete_message_row(self, row_id: int) -> int:
         cur = await self._db.execute("DELETE FROM messages WHERE id = ?", (row_id,))
