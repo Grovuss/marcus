@@ -235,6 +235,31 @@ data — use `/corpus clear` for actual deletion.
 
 ---
 
+## 11. Admin dashboard
+
+Marcus can serve a small password-protected website where you can see
+every server he's in, browse the messages and GIFs he's saved in each
+channel, and send a message as Marcus to any channel he can post in.
+
+Set a password to turn it on (it stays off otherwise):
+
+```
+DASHBOARD_PASSWORD=something-long-and-random
+```
+
+Locally, open http://localhost:8080 (`DASHBOARD_PORT` changes the port).
+On Fly.io, set the secret and open `https://<your-app>.fly.dev`:
+
+```bash
+fly secrets set DASHBOARD_PASSWORD=something-long-and-random
+```
+
+The browser asks for a login. Leave the username blank or type anything,
+and enter the password. Messages sent from the dashboard can't ping
+@everyone, @here or roles.
+
+---
+
 ## Project structure
 
 ```
@@ -256,7 +281,8 @@ marcus/
 ├── services/
 │   ├── message_logger.py           # eligibility checks + text sanitization
 │   ├── gif_logger.py                # GIF URL extraction
-│   └── responder.py                  # probability/cooldown/generation orchestration
+│   ├── responder.py                  # probability/cooldown/generation orchestration
+│   └── dashboard.py                  # password-protected admin website
 ├── requirements.txt
 ├── .env.example
 └── README.md

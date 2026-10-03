@@ -20,6 +20,7 @@ from generator.generator import ResponseGenerator
 from services.message_logger import is_loggable_text
 from services.gif_logger import extract_gif_urls
 from services.responder import Responder
+from services.dashboard import create_dashboard
 
 load_dotenv()
 
@@ -51,6 +52,7 @@ class MarcusBot(commands.Bot):
         self.db = Database()
         self.generator = ResponseGenerator(order=CONFIG["generation"]["markov_order"])
         self.responder = Responder(self.db, self.generator)
+        self.dashboard = create_dashboard(self)
 
     async def setup_hook(self):
         await self.db.connect()
@@ -69,12 +71,17 @@ class MarcusBot(commands.Bot):
             synced = await self.tree.sync()
             log.info("Synced %d global commands.", len(synced))
 
+        if self.dashboard:
+            await self.dashboard.start()
+
     async def on_ready(self):
         log.info("Logged in as %s (id=%s)", self.user, self.user.id)
         activity = discord.Activity(type=discord.ActivityType.watching, name="the server lose its mind")
         await self.change_presence(activity=activity)
 
     async def close(self):
+        if self.dashboard:
+            await self.dashboard.stop()
         await self.db.close()
         await super().close()
 

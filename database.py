@@ -238,6 +238,28 @@ class Database:
         rows = await cur.fetchall()
         return [r["content"] for r in rows]
 
+    async def get_channel_messages(self, channel_id: int, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Full logged message rows for one channel, most recent first (dashboard view)."""
+        cur = await self._db.execute(
+            """SELECT id, message_id, author_id, content, timestamp FROM messages
+               WHERE channel_id = ? ORDER BY id DESC LIMIT ? OFFSET ?""",
+            (str(channel_id), limit, offset),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def count_by_channel(self, guild_id: int) -> dict[str, dict]:
+        """{channel_id: {"messages": n, "gifs": n}} for every channel with logged data."""
+        counts: dict[str, dict] = {}
+        for table, key in (("messages", "messages"), ("gifs", "gifs")):
+            cur = await self._db.execute(
+                f"SELECT channel_id, COUNT(*) AS c FROM {table} WHERE guild_id = ? GROUP BY channel_id",
+                (str(guild_id),),
+            )
+            for row in await cur.fetchall():
+                counts.setdefault(row["channel_id"], {"messages": 0, "gifs": 0})[key] = row["c"]
+        return counts
+
     async def delete_channel_messages(self, channel_id: int) -> int:
         cur = await self._db.execute(
             "DELETE FROM messages WHERE channel_id = ?", (str(channel_id),)
