@@ -97,6 +97,9 @@ form.inline { display:inline; margin:0; }
 .gif a { font-size:12px; word-break:break-all; }
 .queue li { margin:6px 0; }
 label.check { display:flex; gap:6px; align-items:center; font-size:14px; }
+details summary { cursor:pointer; }
+details[open] summary { margin-bottom:8px; }
+details textarea { min-width:280px; font-family:ui-monospace,Consolas,monospace; font-size:13px; }
 .live { font-size:12px; color:var(--ok); margin-bottom:6px; }
 .live.off { color:var(--muted); }
 @keyframes fresh { from { background:var(--mark); } to { background:transparent; } }
@@ -175,6 +178,12 @@ def gif_html(url: str) -> str:
     return f"{media}<a href='{safe}' target='_blank' rel='noopener noreferrer'>{safe}</a>"
 
 
+def clean_response(value) -> str:
+    """Autoresponse text from a form: keep line breaks and markdown, drop browser CRLFs
+    and blank lines around it."""
+    return str(value).replace("\r\n", "\n").strip("\n").rstrip()
+
+
 def looks_like_gif_link(text: str) -> bool:
     text = text.strip()
     if not text or any(c.isspace() for c in text):
@@ -226,6 +235,7 @@ class Dashboard:
         app.router.add_get("/filter", self.filter_view)
         app.router.add_get("/live", self.live)
         app.router.add_post("/c/{channel_id}/send", self.send_message)
+        app.router.add_post("/c/{channel_id}/random", self.send_random)
         app.router.add_post("/c/{channel_id}/memory", self.add_memory)
         app.router.add_post("/queue/{queue_id}/delete", self.delete_queued)
         app.router.add_post("/item/delete", self.delete_item)
@@ -534,6 +544,9 @@ class Dashboard:
                 f"<textarea name='content' maxlength='{MAX_MESSAGE_LEN}' required "
                 f"placeholder='Say something as Marcus in {esc(name)}…'></textarea>"
                 "<div class='row end'>"
+                f"<button class='ghost' style='margin-right:auto' formaction='/c/{channel_id}/random' formnovalidate "
+                "title=\"Marcus generates a message from this channel's memory and posts it\">"
+                "🎲 Send random message</button>"
                 "<button class='ghost' name='action' value='queue' "
                 "title='Marcus posts this the next time someone talks in this channel'>Queue as next message</button>"
                 "<button name='action' value='send'>Send now</button></div>",
@@ -586,13 +599,18 @@ class Dashboard:
         entries = await self.bot.db.list_filter()
         rows = "".join(
             f"<tr><td>{esc(f['pattern'])}</td><td>"
+            + "<details><summary>"
+            + (f"<span>{esc(f['response'].splitlines()[0][:80])}</span>"
+               if f["response"] else "<span class='muted'>No autoresponse (add one)</span>")
+            + "</summary>"
             + self._form(
                 f"/filter/{f['id']}/response",
-                f"<input type='text' name='response' value='{esc(f['response'] or '')}' "
-                f"maxlength='{MAX_MESSAGE_LEN}' placeholder='No autoresponse'>"
-                "<button class='x'>save</button>",
-                cls="row",
+                f"<textarea name='response' rows='8' maxlength='{MAX_MESSAGE_LEN}' "
+                f"placeholder='Leave empty for no autoresponse'>{esc(f['response'] or '')}</textarea>"
+                "<div class='row end'><button>Save</button></div>",
+                cls="stack",
             )
+            + "</details>"
             + f"</td><td class='muted'>{esc((f['created_at'] or '')[:10])}</td>"
             f"<td class='num'>" + self._form(f"/filter/{f['id']}/delete", "<button class='x'>remove</button>")
             + "</td></tr>"
@@ -609,8 +627,10 @@ class Dashboard:
             "<div class='row'><input type='text' name='pattern' required "
             f"maxlength='{MAX_FILTER_LEN}' placeholder='Word, phrase, or GIF link'>"
             "<button>Add to filter</button></div>"
-            f"<input type='text' name='response' maxlength='{MAX_MESSAGE_LEN}' "
-            "placeholder='Optional autoresponse: what Marcus says when someone says this ({user} pings them)'>"
+            f"<textarea name='response' rows='6' maxlength='{MAX_MESSAGE_LEN}' "
+            "placeholder='Optional autoresponse: what Marcus says when someone says this. "
+            "Discord markdown works (headings, **bold**, &gt; quotes, -# small text, links). "
+            "{user} pings whoever said it.'></textarea>"
             "<label class='check'><input type='checkbox' name='purge' value='1' checked>"
             "Also forget everything already saved that matches</label>",
             cls="stack card pad",
@@ -629,6 +649,24 @@ class Dashboard:
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
+    async def send_random(self, request: web.Request):
+        """Post a freshly generated message, drawn only from this channel's memory."""
+        channel_id = self._int_param(request, "channel_id")
+        back = f"/c/{channel_id}"
+        channel = self.bot.get_channel(channel_id)
+        if not self._sendable(channel):
+            raise redirect(back, error="Marcus can't send messages in that channel.")
+
+        result = await self.bot.responder.generate_response(channel.guild.id, channel_id)
+        if not result:
+            raise redirect(back, error="Nothing saved in this channel to generate from yet.")
+        try:
+            await self.bot._send_response(channel, result)
+        except discord.HTTPException as e:
+            raise redirect(back, error=f"Discord rejected it: {e.text or e}")
+        sent = " / ".join(p for p in (result.get("text"), result.get("gif_url")) if p)
+        raise redirect(back, ok=f"Sent: {sent}")
+
     async def send_message(self, request: web.Request):
         channel_id = self._int_param(request, "channel_id")
         form = await request.post()
@@ -708,7 +746,7 @@ class Dashboard:
             raise redirect("/filter", error="Enter a word, phrase, or link.")
         if len(pattern) > MAX_FILTER_LEN:
             raise redirect("/filter", error=f"Keep filter entries under {MAX_FILTER_LEN} characters.")
-        response = str(form.get("response", "")).strip() or None
+        response = clean_response(form.get("response", "")) or None
         if response and len(response) > MAX_MESSAGE_LEN:
             raise redirect("/filter", error=f"Autoresponses max out at {MAX_MESSAGE_LEN} characters.")
         added = await self.bot.db.add_filter(pattern, response)
@@ -725,7 +763,7 @@ class Dashboard:
 
     async def set_filter_response(self, request: web.Request):
         form = await request.post()
-        response = str(form.get("response", "")).strip()
+        response = clean_response(form.get("response", ""))
         if len(response) > MAX_MESSAGE_LEN:
             raise redirect("/filter", error=f"Autoresponses max out at {MAX_MESSAGE_LEN} characters.")
         await self.bot.db.set_filter_response(self._int_param(request, "filter_id"), response or None)
